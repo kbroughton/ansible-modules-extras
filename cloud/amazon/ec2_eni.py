@@ -27,15 +27,32 @@ options:
       - The ID of the ENI
     required: false
     default: null
+  filters:
+    description:
+      - Dictionary of key-value pairs that can be searched to locate eni_id if it is not known.
+    required: false
+    default: null
+    version_added: 2.2
   instance_id:
     description:
-      - Instance ID that you wish to attach ENI to. To detach an ENI from an instance, use 'None'.
+      - Instance ID that you wish to attach ENI to. To detach an ENI from an instance, use 'None'.  To identify an existing attached eni, use filters attachment.instance-id instead.
     required: false
     default: null
   private_ip_address:
     description:
       - Private IP address.
     required: false
+    default: null
+  secondary_private_ip_address_count:
+    version_added: "2.2"
+    description:
+      - Integer, add secondary private ip addresses to the eni_id interface (from the vpc subnet) so total = count.  Do nothing if count >= existing count.
+    required: false
+    default: null
+  secondary_private_ip_addresses:
+    version_added: "2.2"
+    description:
+      - add this list of secondary private ip addresses to the eni_id interface (from the vpc subnet).
     default: null
   subnet_id:
     description:
@@ -83,6 +100,10 @@ extends_documentation_fragment:
 EXAMPLES = '''
 # Note: These examples do not set authentication details, see the AWS Guide for details.
 
+# Note, if you try to assign a secondary which is not available an error will occur:
+# A client error (InvalidParameterValue) occurred when calling the AssignPrivateIpAddresses operation:
+# [10.x.x.x] assigned, but move is not allowed.
+
 # Create an ENI. As no security group is defined, ENI will be created in default security group
 - ec2_eni:
     private_ip_address: 172.31.0.20
@@ -97,6 +118,15 @@ EXAMPLES = '''
     subnet_id: subnet-xxxxxxxx
     state: present
 
+# Create an ENI with secondary ips generated and attached, and attach it to an instance
+- ec2_eni:
+    instance_id: i-xxxxxxx
+    device_index: 1
+    private_ip_address: 172.31.0.20
+    secondary_private_ip_address_count: 3
+    subnet_id: subnet-xxxxxxxx
+    state: present
+
 # Destroy an ENI, detaching it from any instance if necessary
 - ec2_eni:
     eni_id: eni-xxxxxxx
@@ -108,6 +138,20 @@ EXAMPLES = '''
     eni_id: eni-xxxxxxx
     description: "My new description"
     state: present
+
+# Identify an insctance id by primary-ip-address and instance-id, then modify
+# See here for allowed filters http://docs.aws.amazon.com/AWSEC2/latest/CommandLineReference/ApiReference-cmd-DescribeNetworkInterfaces.html
+- ec2_eni:
+    filters: '{ "attachment.instance-id": "i-1234fe78", "primary-ip-address": "10.0.1.2" }'
+    subnet_id: subnet-xxxxxxxx
+    secondary_private_ip_address_count: 2
+
+# Update an ENI adding specified secondary_private_ip_addresses
+- ec2_eni:
+    eni_id: eni-xxxxxxx
+    description: "My new description"
+    state: present
+    secondary_private_ip_addresses: [10.0.1.2,10.0.2.3]
 
 # Detach an ENI from an instance
 - ec2_eni:
@@ -161,6 +205,7 @@ def get_eni_info(interface):
                       'status': interface.status,
                       'mac_address': interface.mac_address,
                       'private_ip_address': interface.private_ip_address,
+                      'secondary_private_ip_addresses': _get_secondary_private_ip_addresses(interface.private_ip_addresses),
                       'source_dest_check': interface.source_dest_check,
                       'groups': dict((group.id, group.name) for group in interface.groups),
                       }
@@ -195,9 +240,15 @@ def create_eni(connection, module):
     instance_id = module.params.get("instance_id")
     if instance_id == 'None':
         instance_id = None
+        do_detach = True
+    else:
+        do_detach = False
     device_index = module.params.get("device_index")
     subnet_id = module.params.get('subnet_id')
     private_ip_address = module.params.get('private_ip_address')
+    secondary_private_ip_address_count = module.params.get('secondary_private_ip_address_count')
+    secondary_private_ip_addresses = module.params.get('secondary_private_ip_addresses')
+
     description = module.params.get('description')
     security_groups = module.params.get('security_groups')
     changed = False
@@ -205,17 +256,24 @@ def create_eni(connection, module):
     try:
         eni = compare_eni(connection, module)
         if eni is None:
-            eni = connection.create_network_interface(subnet_id, private_ip_address, description, security_groups)
+            eni = connection.create_network_interface(subnet_id,
+                                                      private_ip_address,
+                                                      description,
+                                                      security_groups)
+            connection.assign_private_ip_addresses(network_interface_id=eni.id,
+                secondary_private_ip_address_count=secondary_private_ip_address_count,
+                private_ip_addresses=secondary_private_ip_addresses,
+                description=description, groups=security_groups)
             if instance_id is not None:
                 try:
                     eni.attach(instance_id, device_index)
                 except BotoServerError:
                     eni.delete()
                     raise
-                # Wait to allow creation / attachment to finish
-                wait_for_eni(eni, "attached")
-                eni.update()
             changed = True
+            # Wait to allow creation / attachment to finish
+            wait_for_eni(eni, "attached")
+            eni.update()
 
     except BotoServerError as e:
         module.fail_json(msg=get_error_message(e.args[2]))
@@ -223,16 +281,50 @@ def create_eni(connection, module):
     module.exit_json(changed=changed, interface=get_eni_info(eni))
 
 
+def _get_secondary_private_ip_addresses(private_ip_addresses_obj_list):
+    # convert [PrivateIPAddress] to list of only non-primary ips
+    results = []
+    for item in private_ip_addresses_obj_list:
+        if not item.primary:
+            results.append(item.private_ip_address)
+    return results
+
 def modify_eni(connection, module):
 
-    eni_id = module.params.get("eni_id")
+    filters = module.params.get("filters")
     instance_id = module.params.get("instance_id")
+    # Use instance_id to indicate attache/detatch, filters.attachment.instance-id to find eni attached to instance
     if instance_id == 'None':
         instance_id = None
         do_detach = True
     else:
         do_detach = False
+
+
+    if filters:
+        eni_result_set = connection.get_all_network_interfaces(filters=filters)
+        if len(eni_result_set) > 1:
+            mudule.fail_json(msg="Filters were not enough to specify unique eni_id, got {}".format(eni_result_set))
+        elif len(eni_result_set) == 0:
+            module.fail_json(msg="No eni found with specified filters")
+        else:
+            eni = eni_result_set[0]
+            eni_id = eni.id
+    else:
+        eni_id = module.params.get("eni_id")
+        # Get the eni with the eni_id specified
+        eni_result_set = connection.get_all_network_interfaces(eni_id)
+        eni = eni_result_set[0]
+
     device_index = module.params.get("device_index")
+    subnet_id = module.params.get('subnet_id')
+    private_ip_address = module.params.get('private_ip_address')
+    secondary_private_ip_addresses = module.params.get('secondary_private_ip_addresses')
+    if secondary_private_ip_addresses and not isinstance(secondary_private_ip_addresses, list):
+        module.exit_json(msg="secondary_private_ip_addresses should be a python list")
+    secondary_private_ip_address_count = module.params.get('secondary_private_ip_address_count')
+    if secondary_private_ip_address_count and secondary_private_ip_address_count < 0:
+        module.exit_json(msg="secondary_private_ip_address_count should be a positive integer, got {}".format(type(secondary_private_ip_address_count)))
     description = module.params.get('description')
     security_groups = module.params.get('security_groups')
     force_detach = module.params.get("force_detach")
@@ -240,10 +332,11 @@ def modify_eni(connection, module):
     delete_on_termination = module.params.get("delete_on_termination")
     changed = False
 
+    # fail if instance_id does not match attached eid
+    if instance_id and (eni.attachment.instance_id != instance_id):
+        module.fail_json(msg="Supplied instance_id is not consistent with the eni.attachment.instance_id.  Please detach first")
+
     try:
-        # Get the eni with the eni_id specified
-        eni_result_set = connection.get_all_network_interfaces(eni_id)
-        eni = eni_result_set[0]
         if description is not None:
             if eni.description != description:
                 connection.modify_network_interface_attribute(eni.id, "description", description)
@@ -263,12 +356,23 @@ def modify_eni(connection, module):
                     changed = True
             else:
                 module.fail_json(msg="Can not modify delete_on_termination as the interface is not attached")
+
+        if secondary_private_ip_addresses is not None:
+            if set(_get_secondary_private_ip_addresses(eni.private_ip_addresses)) != set(secondary_private_ip_addresses):
+                connection.assign_private_ip_addresses(network_interface_id=eni.id, private_ip_addresses=secondary_private_ip_addresses)
+                changed = True
+        if secondary_private_ip_address_count:
+            # + 1 because primary_ip is in eni.private_ip_addresses
+            diff = secondary_private_ip_address_count + 1 - len(eni.private_ip_addresses)
+            if  diff > 0:
+                connection.assign_private_ip_addresses(eni.id, secondary_private_ip_address_count=diff)
+                changed = True
         if eni.attachment is not None and instance_id is None and do_detach is True:
             eni.detach(force_detach)
             wait_for_eni(eni, "detached")
             changed = True
         else:
-            if instance_id is not None:
+            if instance_id is not None and eni.attachment is None:
                 eni.attach(instance_id, device_index)
                 wait_for_eni(eni, "attached")
                 changed = True
@@ -324,12 +428,15 @@ def compare_eni(connection, module):
 
         for eni in all_eni:
             remote_security_groups = get_sec_group_list(eni.groups)
-            if (eni.subnet_id == subnet_id) and (eni.private_ip_address == private_ip_address) and (eni.description == description) and (sorted(remote_security_groups) == sorted(security_groups)):
+            if ((eni.subnet_id == subnet_id) and
+               (eni.private_ip_address == private_ip_address) and
+               ((set(eni.private_ip_addresses) == set(secondary_private_ip_addresses)) or
+                (len(eni.private_ip_addresses) >= secondary_private_ip_address_count)) and
+               (eni.description == description) and
+               (sorted(remote_security_groups) == sorted(security_groups))):
                 return eni
-
     except BotoServerError as e:
         module.fail_json(msg=get_error_message(e.args[2]))
-
     return None
 
 def get_sec_group_list(groups):
@@ -347,8 +454,11 @@ def main():
     argument_spec.update(
         dict(
             eni_id = dict(default=None),
+            filters = dict(),
             instance_id = dict(default=None),
             private_ip_address = dict(),
+            secondary_private_ip_addresses = dict(default=None, type='list'),
+            secondary_private_ip_address_count = dict(default=None, type='int'),
             subnet_id = dict(),
             description = dict(),
             security_groups = dict(type='list'),
@@ -360,8 +470,11 @@ def main():
         )
     )
 
-    module = AnsibleModule(argument_spec=argument_spec)
-
+    module = AnsibleModule(argument_spec=argument_spec,
+                           mutually_exclusive = [
+                              ['secondary_private_ip_addresses', 'secondary_private_ip_address_count'],
+                              ['eni_id', 'filters']
+            ])
     if not HAS_BOTO:
         module.fail_json(msg='boto required for this module')
 
@@ -377,14 +490,16 @@ def main():
 
     state = module.params.get("state")
     eni_id = module.params.get("eni_id")
+    filters = module.params.get("filters")
 
     if state == 'present':
-        if eni_id is None:
+        if eni_id or filters:
+            modify_eni(connection, module)
+        else:
+            #  If neither eni_id or filters, create a new eni
             if module.params.get("subnet_id") is None:
                 module.fail_json(msg="subnet_id must be specified when state=present")
             create_eni(connection, module)
-        else:
-            modify_eni(connection, module)
     elif state == 'absent':
         if eni_id is None:
             module.fail_json(msg="eni_id must be specified")
